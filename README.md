@@ -36,6 +36,8 @@ KDE Connect's installer and Microsoft Store paths are detected. If detection fai
 - Drag the strip horizontally to a free area of your taskbar. It overlays the taskbar and **does not reserve space** or modify Explorer.
 - Click the green equalizer tray icon to open controls; middle-click toggles playback. Windows may initially hide it behind the **^** arrow.
 - Right-click for phone selection, tray-only mode or Quit.
+- **Theme colour → Follow Windows accent** uses the Windows colour scheme by default and updates when it changes. **Choose custom colour…** opens a colour picker; your choice is saved between launches. The accent applies to playback, sliders, the tray icon and the panel glow.
+- The speaker icon follows the phone-reported volume: muted, low, medium or high.
 - The strip hides for a foreground fullscreen app. Vertical and hidden taskbars use the tray or shortcuts.
 - Playback and volume controls act on the selected phone, not on the PC.
 

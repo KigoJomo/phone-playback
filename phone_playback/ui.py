@@ -20,6 +20,7 @@ from PySide6.QtGui import (
     QCursor,
     QLinearGradient,
     QRadialGradient,
+    QActionGroup,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -31,9 +32,11 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QMenu,
     QPushButton,
+    QColorDialog,
 )
 from . import core
 from .config import save as save_config
+from .theme import accent_for, foreground_for, volume_symbol
 
 BG = "#171b22"
 FG = "#f5f5f7"
@@ -92,7 +95,7 @@ def symbol(p, name, rect, color=FG):
         path.closeSubpath()
         p.drawPath(path)
         p.drawLine(6, -6, 6, 6)
-    elif name == "volume":
+    elif name.startswith("volume"):
         path = QPainterPath()
         path.moveTo(-8, -3)
         path.lineTo(-4, -3)
@@ -103,7 +106,13 @@ def symbol(p, name, rect, color=FG):
         path.closeSubpath()
         p.drawPath(path)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawArc(QRectF(-2, -7, 13, 14), -60 * 16, 120 * 16)
+        if name == "volume-muted":
+            p.drawLine(5, -3, 10, 3)
+            p.drawLine(5, 3, 10, -3)
+        elif name in ("volume-medium", "volume-high"):
+            p.drawArc(QRectF(-1, -4, 8, 8), -60 * 16, 120 * 16)
+            if name == "volume-high":
+                p.drawArc(QRectF(-2, -7, 14, 14), -60 * 16, 120 * 16)
     elif name in ("back15", "ahead15"):
         if name == "back15":
             p.scale(-1, 1)
@@ -165,7 +174,7 @@ class IconButton(QWidget):
                 p,
                 self.rect().adjusted(1, 1, -1, -1),
                 self.width() / 2,
-                "#d1f4d5" if self.hovered else ACCENT,
+                QColor(ACCENT).lighter(112).name() if self.hovered else ACCENT,
             )
         elif self.hovered or self.hasFocus():
             rounded(p, self.rect(), 12, "#2b323d")
@@ -174,7 +183,7 @@ class IconButton(QWidget):
             p,
             self.symbol,
             QRectF((self.width() - size) / 2, (self.height() - size) / 2, size, size),
-            "#142019" if self.primary else FG,
+            foreground_for(ACCENT) if self.primary else FG,
         )
 
 
@@ -250,7 +259,7 @@ class Artwork(QWidget):
         path.addRoundedRect(QRectF(self.rect()), radius, radius)
         p.setClipPath(path)
         gradient = QLinearGradient(0, 0, self.width(), self.height())
-        gradient.setColorAt(0, QColor("#3a594d"))
+        gradient.setColorAt(0, QColor(ACCENT).darker(280))
         gradient.setColorAt(1, QColor("#292d42"))
         p.fillRect(self.rect(), gradient)
         if not self.pixmap.isNull():
@@ -305,7 +314,9 @@ class Surface(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rounded(p, self.rect().adjusted(1, 1, -1, -1), self.radius, BG)
         gradient = QRadialGradient(self.width() * 0.12, 0, self.width() * 0.9)
-        gradient.setColorAt(0, QColor(108, 171, 123, 25))
+        glow = QColor(ACCENT)
+        glow.setAlpha(25)
+        gradient.setColorAt(0, glow)
         gradient.setColorAt(1, QColor(23, 27, 34, 0))
         p.setBrush(gradient)
         p.setPen(QPen(QColor("#343c45"), 1))
@@ -383,7 +394,7 @@ class Slider(QSlider):
         rounded(p, QRectF(5, 7, max(0, x - 5), 4), 2, ACCENT if self.isEnabled() else "#59616c")
         if self.isEnabled():
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#e4f8e6"))
+            p.setBrush(QColor(ACCENT).lighter(170))
             p.drawEllipse(QPoint(round(x), 9), 5, 5)
 
     def value_at(self, e):
@@ -448,8 +459,6 @@ class Panel(Surface):
         text.addWidget(self.title)
         self.artist = label("", 10)
         text.addWidget(self.artist)
-        self.connection = label("●  PHONE CONNECTED", 7, ACCENT, QFont.Weight.DemiBold)
-        text.addWidget(self.connection)
         text.addStretch()
         meta.addLayout(text, 1)
         layout.addLayout(meta)
@@ -488,7 +497,10 @@ class Panel(Surface):
         layout.addSpacing(18)
         volume = QHBoxLayout()
         volume.setSpacing(10)
-        volume.addWidget(IconButton("volume", lambda: None, 22, tip="Phone volume"))
+        self.volume_icon = IconButton("volume-muted", lambda: None, 22, tip="Phone volume")
+        self.volume_icon.setCursor(Qt.CursorShape.ArrowCursor)
+        self.volume_icon.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        volume.addWidget(self.volume_icon)
         self.volume = Slider(Qt.Orientation.Horizontal)
         self.volume.setRange(0, 100)
         self.volume.setStyleSheet(SLIDER_STYLE)
@@ -505,7 +517,6 @@ class Panel(Surface):
         layout.addLayout(volume)
         layout.addStretch(1)
         footer = QHBoxLayout()
-        footer.addWidget(label("AUDIO ON YOUR PHONE", 7, "#707d88", QFont.Weight.DemiBold))
         footer.addStretch()
         footer.addWidget(label("CTRL + ALT + SPACE", 7, "#707d88"))
         layout.addLayout(footer)
@@ -524,7 +535,9 @@ def tray_icon():
     p = QPainter(pixmap)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     rounded(p, QRectF(2, 2, 60, 60), 18, ACCENT)
-    p.setPen(QPen(QColor("#17231c"), 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.setPen(
+        QPen(QColor(foreground_for(ACCENT)), 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    )
     for x, h in [(20, 12), (32, 28), (44, 19)]:
         p.drawLine(x, 32 - h // 2, x, 32 + h // 2)
     p.end()
@@ -567,7 +580,9 @@ class Taskbar:
 
 class Controller:
     def __init__(self):
+        global ACCENT
         self.settings = core.CONFIG
+        ACCENT = accent_for(self.settings)
         self.state = {}
         self.connected = False
         self.last_pos = 0
@@ -593,12 +608,22 @@ class Controller:
         self.dock_action.setCheckable(True)
         self.dock_action.setChecked(self.settings.get("show_dock", True))
         self.dock_action.toggled.connect(self.toggle_dock)
+        theme_menu = self.menu.addMenu("Theme colour")
+        self.theme_group = QActionGroup(self.menu)
+        self.windows_theme = theme_menu.addAction("Follow Windows accent")
+        self.custom_theme = theme_menu.addAction("Choose custom colour…")
+        for action in (self.windows_theme, self.custom_theme):
+            action.setCheckable(True)
+            self.theme_group.addAction(action)
+        self.windows_theme.triggered.connect(self.follow_windows_theme)
+        self.custom_theme.triggered.connect(self.choose_custom_colour)
         self.menu.addSeparator()
         self.menu.addAction("Quit Phone Playback", self.quit)
         self.tray = QSystemTrayIcon(tray_icon())
         self.tray.setToolTip("Phone Playback · connecting")
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self.tray_activated)
+        self.apply_theme(force=True)
         if not PREVIEW:
             self.tray.show()
         self.pill.title.setText("Connecting to phone…")
@@ -632,6 +657,45 @@ class Controller:
 
     def save_settings(self):
         save_config(self.settings)
+
+    def apply_theme(self, force=False):
+        global ACCENT
+        colour = accent_for(self.settings)
+        custom = self.settings.get("theme_source") == "custom"
+        self.windows_theme.setChecked(not custom)
+        self.custom_theme.setChecked(custom)
+        if not force and colour == ACCENT:
+            return
+        ACCENT = colour
+        selected = QColor(ACCENT).darker(280).name()
+        self.menu.setStyleSheet(
+            "QMenu {background:#20262f; color:#e9edf1; border:1px solid #3c4550; padding:6px;} "
+            "QMenu::item {padding:8px 18px;} QMenu::item:selected {background:" + selected + ";}"
+        )
+        icon = tray_icon()
+        self.tray.setIcon(icon)
+        QApplication.setWindowIcon(icon)
+        for surface in (self.pill, self.panel):
+            surface.update()
+            for widget in surface.findChildren(QWidget):
+                widget.update()
+
+    def follow_windows_theme(self):
+        self.settings["theme_source"] = "windows"
+        self.save_settings()
+        self.apply_theme(force=True)
+
+    def choose_custom_colour(self):
+        self.menu_open = True
+        try:
+            colour = QColorDialog.getColor(QColor(ACCENT), self.panel, "Accent colour")
+            if colour.isValid():
+                self.settings.update(theme_source="custom", accent_colour=colour.name())
+                self.save_settings()
+            self.apply_theme(force=True)
+        finally:
+            self.menu_open = False
+            self.opened_at = time.monotonic()
 
     def toggle_dock(self, on):
         self.settings["show_dock"] = on
@@ -759,8 +823,6 @@ class Controller:
             (value.get("device_name", "Phone") + "  /  " + value.get("player", "Player")).upper()
         )
         self.panel.source.setToolTip("Choose phone player")
-        self.panel.connection.setText("●  PHONE CONNECTED")
-        self.panel.connection.setStyleSheet("color:" + ACCENT)
         for art in (self.pill.art, self.panel.art):
             art.setPath(value.get("localAlbumArtUrl", ""))
         name = "pause" if value.get("isPlaying") else "play"
@@ -776,10 +838,14 @@ class Controller:
             button.setEnabled(available and bool(value.get("canSeek")))
         self.panel.seek.setEnabled(available and bool(value.get("canSeek")))
         self.panel.volume.setEnabled(available)
+        self.panel.volume_icon.setEnabled(available)
         self.panel.seek.setRange(0, max(1, value.get("length", 0)))
         if not self.panel.volume.isSliderDown():
             self.panel.volume.setValue(value.get("volume", 0))
         self.panel.volume_text.setText(str(value.get("volume", 0)) + "%")
+        self.panel.volume_icon.symbol = volume_symbol(value.get("volume", 0))
+        self.panel.volume_icon.setToolTip(f"Phone volume: {value.get('volume', 0)}%")
+        self.panel.volume_icon.update()
         self.tray.setToolTip(
             (
                 title
@@ -796,9 +862,6 @@ class Controller:
         self.connected = False
         self.pill.title.setText("Phone disconnected")
         self.pill.play.setEnabled(False)
-        self.panel.connection.setText("●  PHONE DISCONNECTED")
-        self.panel.connection.setStyleSheet("color:#e4bc87")
-        self.panel.connection.setToolTip(message)
         self.panel.title.setText("Connect your phone")
         self.panel.artist.setText(message[:40])
         self.tray.setToolTip("Phone Playback · disconnected")
@@ -806,6 +869,8 @@ class Controller:
             button.setEnabled(False)
         self.panel.seek.setEnabled(False)
         self.panel.volume.setEnabled(False)
+        self.panel.volume_icon.setEnabled(False)
+        self.panel.volume_icon.setToolTip("Phone volume unavailable")
 
     def poll(self):
         now = time.monotonic()
@@ -830,6 +895,7 @@ class Controller:
             elif kind == "hotkeys" and value:
                 self.menu.addAction("Shortcut unavailable: " + ", ".join(value)).setEnabled(False)
         if now - self.last_position_check > 1:
+            self.apply_theme()
             self.position_dock()
             self.last_position_check = now
         pos = QCursor.pos()

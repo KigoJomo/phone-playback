@@ -98,6 +98,35 @@ class InteractionTests(unittest.TestCase):
         self.assertFalse(c.panel.play.isEnabled())
         self.assertFalse(c.panel.seek.isEnabled())
 
+    def test_icon_uses_phone_reported_volume(self):
+        c = self.controller
+        for volume, icon in ((0, "muted"), (10, "low"), (50, "medium"), (90, "high")):
+            c.apply_state({**c.state, "volume": volume})
+            self.assertEqual(c.panel.volume_icon.symbol, "volume-" + icon)
+            self.assertIn(str(volume) + "%", c.panel.volume_icon.toolTip())
+
+    def test_custom_colour_persists_and_windows_changes_refresh(self):
+        c = self.controller
+        with (
+            patch.object(m.QColorDialog, "getColor", return_value=m.QColor("#ea580c")),
+            patch.object(m, "save_config") as save,
+        ):
+            c.choose_custom_colour()
+            self.assertEqual(c.settings["accent_colour"], "#ea580c")
+            self.assertEqual(m.ACCENT, "#ea580c")
+            self.assertTrue(c.custom_theme.isChecked())
+            save.assert_called_once()
+        with (
+            patch("phone_playback.theme.windows_accent", return_value="#2563eb"),
+            patch.object(m, "save_config"),
+        ):
+            c.follow_windows_theme()
+            self.assertEqual(m.ACCENT, "#2563eb")
+            self.assertTrue(c.windows_theme.isChecked())
+        with patch("phone_playback.theme.windows_accent", return_value="#8b5cf6"):
+            c.apply_theme()
+            self.assertEqual(m.ACCENT, "#8b5cf6")
+
     def test_marquee_and_layout(self):
         c = self.controller
         self.clock.now += 5
