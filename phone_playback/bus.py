@@ -62,8 +62,16 @@ def parse(it):
             v = string()
             basic(it, C.byref(v))
             v = v.value.decode("utf-8") if v.value else ""
-        elif t in (ord("b"), ord("i"), ord("u")):
-            v = integer()
+        elif t in (ord("b"), ord("i"), ord("u"), ord("x"), ord("t"), ord("d")):
+            v = (
+                C.c_int64()
+                if t == ord("x")
+                else C.c_uint64()
+                if t == ord("t")
+                else C.c_double()
+                if t == ord("d")
+                else integer()
+            )
             basic(it, C.byref(v))
             v = v.value
         elif t in (ord("a"), ord("v"), ord("r"), ord("e")):

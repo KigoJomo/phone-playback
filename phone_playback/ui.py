@@ -1,7 +1,6 @@
 """Taskbar-edge now-playing pill, native tray and transient hover controls."""
 
-import sys, time, json, ctypes as C, threading, os
-from ctypes import wintypes as W
+import sys, time, json, threading, os
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -33,10 +32,14 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QColorDialog,
+    QMessageBox,
 )
 from . import core
 from .config import save as save_config
-from .theme import accent_for, foreground_for, volume_symbol
+from .theme import accent_for, foreground_for, volume_symbol, album_accent
+from .taskbar import Taskbar, screen_key
+from .placement import free_slot, WheelSteps
+from . import startup
 
 BG = "#171b22"
 FG = "#f5f5f7"
@@ -354,26 +357,25 @@ class Pill(Surface):
         if e.button() == Qt.MouseButton.LeftButton:
             self.dragging = True
             self.origin = e.globalPosition().toPoint()
-            self.start_x = self.x()
+            self.start_position = self.pos()
 
     def mouseMoveEvent(self, e):
         if self.dragging:
-            self.move(self.start_x + e.globalPosition().toPoint().x() - self.origin.x(), self.y())
+            self.move(self.start_position + e.globalPosition().toPoint() - self.origin)
 
     def mouseReleaseEvent(self, e):
         if self.dragging:
             self.dragging = False
-            if abs(e.globalPosition().toPoint().x() - self.origin.x()) < 4:
+            if (e.globalPosition().toPoint() - self.origin).manhattanLength() < 4:
                 self.controller.open_panel()
             else:
-                self.controller.settings["dock_x"] = self.x()
-                self.controller.save_settings()
+                self.controller.finish_drag(e.globalPosition().toPoint())
 
     def contextMenuEvent(self, e):
         self.controller.menu.exec(e.globalPos())
 
     def wheelEvent(self, e):
-        self.controller.command("volume", 5 if e.angleDelta().y() > 0 else -5)
+        self.controller.wheel_event(e)
 
 
 SLIDER_STYLE = ""
@@ -383,6 +385,7 @@ class Slider(QSlider):
     def __init__(self, orientation):
         super().__init__(orientation)
         self.setFixedHeight(18)
+        self.wheel_handler = None
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -416,8 +419,11 @@ class Slider(QSlider):
             self.setSliderDown(False)
 
     def wheelEvent(self, e):
-        super().wheelEvent(e)
-        self.sliderReleased.emit()
+        if self.wheel_handler:
+            self.wheel_handler(e)
+        else:
+            super().wheelEvent(e)
+            self.sliderReleased.emit()
 
     def keyPressEvent(self, e):
         super().keyPressEvent(e)
@@ -464,6 +470,7 @@ class Panel(Surface):
         layout.addLayout(meta)
         layout.addSpacing(20)
         self.seek = Slider(Qt.Orientation.Horizontal)
+        self.seek.wheel_handler = controller.wheel_event
         self.seek.setStyleSheet(SLIDER_STYLE)
         self.seek.setAccessibleName("Track position")
         self.seek.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -503,6 +510,7 @@ class Panel(Surface):
         volume.addWidget(self.volume_icon)
         self.volume = Slider(Qt.Orientation.Horizontal)
         self.volume.setRange(0, 100)
+        self.volume.wheel_handler = controller.wheel_event
         self.volume.setStyleSheet(SLIDER_STYLE)
         self.volume.setAccessibleName("Phone volume")
         self.volume.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -517,6 +525,8 @@ class Panel(Surface):
         layout.addLayout(volume)
         layout.addStretch(1)
         footer = QHBoxLayout()
+        self.feedback = label("", 8, ACCENT)
+        footer.addWidget(self.feedback)
         footer.addStretch()
         footer.addWidget(label("CTRL + ALT + SPACE", 7, "#707d88"))
         layout.addLayout(footer)
@@ -526,7 +536,7 @@ class Panel(Surface):
             self.hide()
 
     def wheelEvent(self, e):
-        self.controller.command("volume", 5 if e.angleDelta().y() > 0 else -5)
+        self.controller.wheel_event(e)
 
 
 def tray_icon():
@@ -544,44 +554,17 @@ def tray_icon():
     return QIcon(pixmap)
 
 
-class Taskbar:
-    def __init__(self):
-        self.u = C.WinDLL("user32")
-        self.u.FindWindowW.argtypes = [W.LPCWSTR, W.LPCWSTR]
-        self.u.FindWindowW.restype = W.HWND
-        self.u.FindWindowExW.argtypes = [W.HWND, W.HWND, W.LPCWSTR, W.LPCWSTR]
-        self.u.FindWindowExW.restype = W.HWND
-        self.u.GetWindowRect.argtypes = [W.HWND, C.POINTER(W.RECT)]
-        self.u.GetForegroundWindow.restype = W.HWND
-
-    def rect(self, hwnd):
-        r = W.RECT()
-        if not hwnd or not self.u.GetWindowRect(hwnd, C.byref(r)):
-            return QRect()
-        d = QApplication.primaryScreen().devicePixelRatio()
-        return QRect(
-            round(r.left / d),
-            round(r.top / d),
-            round((r.right - r.left) / d),
-            round((r.bottom - r.top) / d),
-        )
-
-    def geometry(self):
-        hwnd = self.u.FindWindowW("Shell_TrayWnd", None)
-        return self.rect(hwnd), self.rect(self.u.FindWindowExW(hwnd, None, "TrayNotifyWnd", None))
-
-    def fullscreen(self, ours):
-        hwnd = self.u.GetForegroundWindow()
-        if int(hwnd or 0) in ours:
-            return False
-        rect = self.rect(hwnd)
-        return not rect.isNull() and rect.contains(QApplication.primaryScreen().geometry())
-
-
 class Controller:
     def __init__(self):
         global ACCENT
         self.settings = core.CONFIG
+        self.album_colour = None
+        self.album_url = None
+        self.current_layout = None
+        self.wheel_steps = WheelSteps()
+        self.feedback_until = 0
+        self.feedback_kind = None
+        self.now_playing_text = ""
         ACCENT = accent_for(self.settings)
         self.state = {}
         self.connected = False
@@ -604,6 +587,18 @@ class Controller:
         self.phone_menu = self.menu.addMenu("Choose phone")
         self.phone_menu.addAction("Searching for paired phones…").setEnabled(False)
         self.menu.addAction("Open controls", self.open_panel)
+        self.startup_action = self.menu.addAction("Start with Windows")
+        self.startup_action.setCheckable(True)
+        self.startup_action.setChecked(startup.enabled())
+        self.startup_action.toggled.connect(self.toggle_startup)
+        self.follow_action = self.menu.addAction("Follow active player")
+        self.follow_action.setCheckable(True)
+        self.follow_action.setChecked(not self.settings.get("player_lock"))
+        self.follow_action.toggled.connect(lambda on: core.commands.put(("follow", on)))
+        self.monitor_menu = self.menu.addMenu("Taskbar display")
+        self.refresh_monitors()
+        QApplication.instance().screenAdded.connect(lambda screen: self.refresh_monitors())
+        QApplication.instance().screenRemoved.connect(lambda screen: self.refresh_monitors())
         self.dock_action = self.menu.addAction("Show song title on taskbar")
         self.dock_action.setCheckable(True)
         self.dock_action.setChecked(self.settings.get("show_dock", True))
@@ -612,11 +607,13 @@ class Controller:
         self.theme_group = QActionGroup(self.menu)
         self.windows_theme = theme_menu.addAction("Follow Windows accent")
         self.custom_theme = theme_menu.addAction("Choose custom colour…")
-        for action in (self.windows_theme, self.custom_theme):
+        self.album_theme = theme_menu.addAction("Album artwork")
+        for action in (self.windows_theme, self.custom_theme, self.album_theme):
             action.setCheckable(True)
             self.theme_group.addAction(action)
         self.windows_theme.triggered.connect(self.follow_windows_theme)
         self.custom_theme.triggered.connect(self.choose_custom_colour)
+        self.album_theme.triggered.connect(self.follow_album_theme)
         self.menu.addSeparator()
         self.menu.addAction("Quit Phone Playback", self.quit)
         self.tray = QSystemTrayIcon(tray_icon())
@@ -660,10 +657,11 @@ class Controller:
 
     def apply_theme(self, force=False):
         global ACCENT
-        colour = accent_for(self.settings)
+        colour = accent_for(self.settings, self.album_colour)
         custom = self.settings.get("theme_source") == "custom"
-        self.windows_theme.setChecked(not custom)
+        self.windows_theme.setChecked(self.settings.get("theme_source") not in ("custom", "album"))
         self.custom_theme.setChecked(custom)
+        self.album_theme.setChecked(self.settings.get("theme_source") == "album")
         if not force and colour == ACCENT:
             return
         ACCENT = colour
@@ -679,6 +677,78 @@ class Controller:
             surface.update()
             for widget in surface.findChildren(QWidget):
                 widget.update()
+
+    def follow_album_theme(self):
+        self.settings["theme_source"] = "album"
+        self.save_settings()
+        self.apply_theme(force=True)
+
+    def toggle_startup(self, on):
+        try:
+            startup.set_enabled(on)
+        except OSError as error:
+            self.startup_action.blockSignals(True)
+            self.startup_action.setChecked(startup.enabled())
+            self.startup_action.blockSignals(False)
+            QMessageBox.warning(self.panel, "Startup preference", str(error))
+
+    def refresh_monitors(self):
+        self.monitor_menu.clear()
+        for screen in QApplication.screens():
+            action = self.monitor_menu.addAction(screen.name() or "Primary display")
+            action.setCheckable(True)
+            action.setChecked(
+                screen_key(screen)
+                == self.settings.get("dock_monitor", screen_key(QApplication.primaryScreen()))
+            )
+            action.triggered.connect(
+                lambda checked=False, name=screen_key(screen): self.select_monitor(name)
+            )
+
+    def select_monitor(self, name):
+        self.settings["dock_monitor"] = name
+        self.save_settings()
+        self.refresh_monitors()
+        self.position_dock()
+
+    def finish_drag(self, point):
+        layouts = self.taskbar.layouts(QApplication.screens())
+        if not layouts:
+            self.position_dock()
+            return
+        layout = min(layouts, key=lambda item: (item["bar"].center() - point).manhattanLength())
+        self.settings["dock_monitor"] = layout["name"]
+        bar = layout["bar"]
+        fraction = (self.pill.x() - bar.left()) / max(1, bar.width() - self.pill.width())
+        self.settings.setdefault("dock_positions", {})[layout["name"]] = max(0, min(1, fraction))
+        self.settings.pop("dock_x", None)
+        self.save_settings()
+        self.refresh_monitors()
+        self.position_dock()
+
+    def show_feedback(self, text, kind=None):
+        self.feedback_until = time.monotonic() + 1.3
+        self.feedback_kind = kind
+        self.pill.title.setText(text)
+        self.panel.feedback.setText(text)
+
+    def wheel_event(self, event):
+        mode, amount = self.wheel_steps.consume(
+            event.angleDelta().y(), bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        )
+        event.accept()
+        if not amount or not self.connected or not self.state.get("playerAvailable", True):
+            return
+        if mode == "seek":
+            if not self.state.get("canSeek") or not self.state.get("length"):
+                self.show_feedback("Seeking unavailable")
+                return
+            self.command("seek", amount)
+            self.show_feedback(f"Seek {amount:+d}s", "seek")
+        else:
+            self.command("volume", amount)
+            estimate = max(0, min(100, self.state.get("volume", 0) + amount))
+            self.show_feedback(f"Volume {estimate}%", "volume")
 
     def follow_windows_theme(self):
         self.settings["theme_source"] = "windows"
@@ -713,7 +783,7 @@ class Controller:
 
     def command(self, action, value):
         if self.connected:
-            core.commands.put((action, value))
+            core.commands.put((action, value, self.state.get("player")))
 
     def update_devices(self, devices):
         self.phone_menu.clear()
@@ -733,6 +803,11 @@ class Controller:
         menu = QMenu(self.panel)
         menu.setStyleSheet(self.menu.styleSheet())
         self.menu_open = True
+        automatic = menu.addAction("Follow active player")
+        automatic.setCheckable(True)
+        automatic.setChecked(not self.state.get("playerLocked", self.settings.get("player_lock")))
+        automatic.triggered.connect(lambda: core.commands.put(("follow", True)))
+        menu.addSeparator()
         for name in self.state.get("playerList", []):
             action = menu.addAction(name)
             action.setCheckable(True)
@@ -745,36 +820,50 @@ class Controller:
         self.opened_at = time.monotonic()
 
     def position_dock(self):
-        bar, tray = self.taskbar.geometry()
-        screen = QApplication.primaryScreen().geometry()
+        layouts = self.taskbar.layouts(QApplication.screens())
+        if not layouts:
+            self.current_layout = None
+            self.pill.hide()
+            return
+        selected = self.settings.get("dock_monitor", screen_key(QApplication.primaryScreen()))
+        layout = next((item for item in layouts if item["name"] == selected), layouts[0])
+        self.current_layout = layout
+        bar = layout["bar"]
         self.bar = bar
         visible = (
-            bar.width() > bar.height() > 0
-            and screen.intersects(bar)
+            layout["known"]
+            and bar.width() > bar.height() >= self.pill.height() + 2
+            and layout["screen"].geometry().intersects(bar)
             and self.settings.get("show_dock", True)
         )
         if not PREVIEW and self.taskbar.fullscreen(
-            {int(self.pill.winId()), int(self.panel.winId())}
+            {int(self.pill.winId()), int(self.panel.winId())}, layout.get("physical_screen")
         ):
             visible = False
+        intervals = [(r.left(), r.right() + 1) for r in layout["occupied"] if r.intersects(bar)]
+        fraction = self.settings.get("dock_positions", {}).get(layout["name"], 1)
+        desired = bar.left() + fraction * max(0, bar.width() - self.pill.width())
+        x = free_slot(bar.left(), bar.right() + 1, intervals, self.pill.width(), desired)
+        if x is None:
+            visible = False
+        if self.pill.dragging:
+            return
         if visible:
-            default_x = (
-                (tray.left() if not tray.isNull() else bar.right() - 200) - self.pill.width() - 10
-            )
-            x = max(
-                bar.left() + 10,
-                min(bar.right() - self.pill.width() - 10, self.settings.get("dock_x", default_x)),
-            )
-            y = bar.center().y() - self.pill.height() // 2
-            if not self.pill.dragging:
-                self.pill.move(x, y)
+            self.pill.move(round(x), bar.center().y() - self.pill.height() // 2)
             self.pill.show()
             self.pill.raise_()
         else:
             self.pill.hide()
 
     def open_panel(self):
-        screen = QApplication.primaryScreen().geometry()
+        target_screen = (
+            self.current_layout["screen"] if self.current_layout else QApplication.primaryScreen()
+        )
+        try:
+            screen = target_screen.geometry()
+        except RuntimeError:
+            # QScreen may be deleted between a monitor-unplug event and the next scan.
+            screen = QApplication.primaryScreen().geometry()
         anchor = self.pill.geometry() if self.pill.isVisible() else self.tray.geometry()
         if anchor.isNull():
             anchor = QRect(screen.right() - 365, screen.bottom() - 45, 260, 34)
@@ -812,7 +901,22 @@ class Controller:
             self.last_pos_time = now
         title = value.get("title") or "Start audio on your phone"
         artist = value.get("artist") or "Ready when you are"
-        self.pill.title.setText(title + "  ·  " + artist if value.get("artist") else title)
+        self.now_playing_text = title + "  ·  " + artist if value.get("artist") else title
+        if now >= self.feedback_until:
+            self.pill.title.setText(self.now_playing_text)
+        elif self.feedback_kind == "volume":
+            self.pill.title.setText(f"Volume {value.get('volume', 0)}%")
+            self.panel.feedback.setText(f"Volume {value.get('volume', 0)}%")
+        self.follow_action.blockSignals(True)
+        self.follow_action.setChecked(not value.get("playerLocked", False))
+        self.follow_action.blockSignals(False)
+        if old.get("player") and value.get("player") != old.get("player"):
+            self.show_feedback("Controlling " + value.get("player", "Player"))
+        url = value.get("localAlbumArtUrl", "")
+        if url != self.album_url:
+            self.album_url = url
+            self.album_colour = album_accent(url)
+            self.apply_theme()
         self.panel.title.setText(title)
         self.panel.artist.setText(
             QFontMetrics(self.panel.artist.font()).elidedText(
@@ -830,7 +934,7 @@ class Controller:
         self.pill.play.update()
         self.panel.play.symbol = name
         self.panel.play.update()
-        available = bool(value.get("playerList"))
+        available = bool(value.get("playerList")) and value.get("playerAvailable", True)
         self.pill.play.setEnabled(available)
         for button in self.panel.controls:
             button.setEnabled(available)
@@ -894,6 +998,13 @@ class Controller:
                     self.open_panel()
             elif kind == "hotkeys" and value:
                 self.menu.addAction("Shortcut unavailable: " + ", ".join(value)).setEnabled(False)
+        if self.feedback_until and now >= self.feedback_until:
+            self.feedback_until = 0
+            self.feedback_kind = None
+            self.pill.title.setText(
+                self.now_playing_text if self.connected else "Phone disconnected"
+            )
+            self.panel.feedback.setText("")
         if now - self.last_position_check > 1:
             self.apply_theme()
             self.position_dock()
@@ -936,6 +1047,8 @@ class Controller:
 
     def quit(self):
         core.stop.set()
+        if hasattr(self.taskbar, "stop"):
+            self.taskbar.stop.set()
         self.tray.hide()
         QApplication.quit()
 
@@ -946,6 +1059,10 @@ def stamp(ms):
 
 
 def main():
+    if "--self-test" in sys.argv:
+        from .diagnostics import run
+
+        return run()
     if not PREVIEW and not core.single_instance():
         return
     app = QApplication(sys.argv)

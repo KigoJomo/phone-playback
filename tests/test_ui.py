@@ -26,8 +26,17 @@ class InteractionTests(unittest.TestCase):
                 m,
                 "Taskbar",
                 lambda: SimpleNamespace(
-                    geometry=lambda: (m.QRect(0, 760, 800, 40), m.QRect(700, 760, 100, 40)),
-                    fullscreen=lambda ours: False,
+                    layouts=lambda screens: [
+                        {
+                            "name": screens[0].name(),
+                            "screen": screens[0],
+                            "bar": m.QRect(0, 760, 800, 40),
+                            "tray": m.QRect(700, 760, 100, 40),
+                            "occupied": [m.QRect(0, 760, 80, 40), m.QRect(700, 760, 100, 40)],
+                            "known": True,
+                        }
+                    ],
+                    fullscreen=lambda *args: False,
                 ),
             ),
         ]
@@ -36,6 +45,7 @@ class InteractionTests(unittest.TestCase):
             self.addCleanup(item.stop)
         self.controller = m.Controller()
         self.controller.timer.stop()
+        self.addCleanup(self.controller.menu.deleteLater)
         self.controller.apply_state(
             {
                 "title": "A long song title for scrolling across the taskbar",
@@ -81,14 +91,14 @@ class InteractionTests(unittest.TestCase):
         c = self.controller
         c.panel.volume.setValue(35)
         c.panel.volume.sliderReleased.emit()
-        self.assertEqual(m.core.commands.get_nowait(), ("set-volume", 35))
+        self.assertEqual(m.core.commands.get_nowait(), ("set-volume", 35, "Music"))
         c.panel.seek.setValue(32000)
         c.panel.seek.sliderReleased.emit()
-        self.assertEqual(m.core.commands.get_nowait(), ("position", 32000))
+        self.assertEqual(m.core.commands.get_nowait(), ("position", 32000, "Music"))
         c.panel.controls[0].callback()
-        self.assertEqual(m.core.commands.get_nowait(), ("seek", -15))
+        self.assertEqual(m.core.commands.get_nowait(), ("seek", -15, "Music"))
         c.panel.play.callback()
-        self.assertEqual(m.core.commands.get_nowait(), ("action", "PlayPause"))
+        self.assertEqual(m.core.commands.get_nowait(), ("action", "PlayPause", "Music"))
 
     def test_disconnected_commands_are_not_queued(self):
         c = self.controller
@@ -133,6 +143,69 @@ class InteractionTests(unittest.TestCase):
         c.pill.title.animate()
         self.assertGreater(c.pill.title.offset, 0)
         self.assertLessEqual(c.panel.layout().minimumSize().height(), c.panel.height())
+
+    def test_shift_wheel_seeks_and_feedback_dismisses(self):
+        c = self.controller
+        accepted = []
+        event = SimpleNamespace(
+            angleDelta=lambda: m.QPoint(0, 120),
+            modifiers=lambda: m.Qt.KeyboardModifier.ShiftModifier,
+            accept=lambda: accepted.append(True),
+        )
+        c.wheel_event(event)
+        self.assertEqual(m.core.commands.get_nowait(), ("seek", 10, "Music"))
+        self.assertEqual(c.panel.feedback.text(), "Seek +10s")
+        self.assertTrue(accepted)
+        self.clock.now += 2
+        c.poll()
+        self.assertEqual(c.panel.feedback.text(), "")
+        self.assertEqual(c.pill.title.text, c.now_playing_text)
+
+    def test_crowded_or_unknown_taskbar_uses_tray_only(self):
+        c = self.controller
+        screen = self.app.primaryScreen()
+        layout = {
+            "name": screen.name(),
+            "screen": screen,
+            "bar": m.QRect(0, 760, 800, 40),
+            "tray": m.QRect(700, 760, 100, 40),
+            "occupied": [m.QRect(0, 760, 800, 40)],
+            "known": True,
+        }
+        c.taskbar.layouts = lambda screens: [layout]
+        c.position_dock()
+        self.assertFalse(c.pill.isVisible())
+        layout.update(known=False, occupied=[])
+        c.position_dock()
+        self.assertFalse(c.pill.isVisible())
+
+    def test_removed_monitor_drops_stale_screen_reference(self):
+        c = self.controller
+        c.current_layout = {"screen": object()}
+        c.taskbar.layouts = lambda screens: []
+        c.position_dock()
+        self.assertIsNone(c.current_layout)
+        self.assertFalse(c.pill.isVisible())
+
+    def test_album_theme_does_not_replace_custom_colour(self):
+        c = self.controller
+        with (
+            patch.object(m, "save_config"),
+            patch.object(m, "album_accent", return_value="#d97962"),
+        ):
+            c.settings.update(theme_source="custom", accent_colour="#ea580c")
+            c.apply_state({**c.state, "localAlbumArtUrl": "file:///missing-art.png"})
+            self.assertEqual(m.ACCENT, "#ea580c")
+            c.follow_album_theme()
+            self.assertEqual(m.ACCENT, "#d97962")
+
+    def test_pinned_missing_player_disables_transport(self):
+        c = self.controller
+        c.apply_state(
+            {**c.state, "player": "Missing", "playerAvailable": False, "playerLocked": True}
+        )
+        self.assertFalse(c.panel.play.isEnabled())
+        self.assertFalse(c.follow_action.isChecked())
 
     def test_first_run_phone_selection_works_while_disconnected(self):
         c = self.controller

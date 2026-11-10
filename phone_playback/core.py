@@ -10,6 +10,7 @@ import time
 BASE = Path(__file__).resolve().parent
 from .config import load, save
 from .media import PlaybackClock, seek_to, seek_relative
+from .player_follow import PlayerFollower
 
 CONFIG = load()
 MEDIA = "org.kde.kdeconnect.device.mprisremote"
@@ -67,24 +68,39 @@ def select_device(device):
 
 
 def media_worker():
-    last_request = last_discovery = 0
+    last_request = last_discovery = last_follow = 0
     clock = PlaybackClock()
+    follower = PlayerFollower()
+    statuses = {}
     while not stop.is_set():
         pending = []
-        while True:
-            try:
-                item = commands.get_nowait()
-                if item[0] == "device":
-                    select_device(item[1])
-                    clock = PlaybackClock()
-                    pending.clear()
-                else:
-                    pending.append(item)
-            except queue.Empty:
-                break
         try:
             from .bus import call
 
+            while True:
+                try:
+                    item = commands.get_nowait()
+                except queue.Empty:
+                    break
+                action, value = item[:2]
+                if action == "device":
+                    select_device(value)
+                    clock = PlaybackClock()
+                    follower = PlayerFollower()
+                    last_follow = 0
+                    pending.clear()
+                elif action == "follow":
+                    if value:
+                        CONFIG.pop("player_lock", None)
+                    else:
+                        CONFIG["player_lock"] = CONFIG.get("last_player")
+                    save(CONFIG)
+                    last_follow = 0
+                elif action == "player":
+                    CONFIG["player_lock"] = value
+                    save(CONFIG)
+                else:
+                    pending.append(item)
             now = time.monotonic()
             if now - last_discovery > 10 or not last_discovery:
                 available = devices(call)
@@ -101,39 +117,84 @@ def media_worker():
             if not device.get("isPaired") or not device.get("isReachable"):
                 raise RuntimeError("Phone offline. Check KDE Connect and Wi-Fi.")
             state = dict(call(media_path, PROPERTIES, "GetAll", (MEDIA,))[0])
+            players = state.get("playerList", [])
+            locked = CONFIG.get("player_lock")
+            if now - last_follow > 1.2 or not last_follow:
+                try:
+                    statuses = follower.statuses(call, device.get("name", ""), players)
+                except RuntimeError:
+                    statuses = {}
+                last_follow = now
+            target = follower.choose(state.get("player"), statuses, locked)
+            if target and target in players and target != state.get("player"):
+                call(media_path, PROPERTIES, "Set", (MEDIA, "player", (target,)))
+                state = dict(call(media_path, PROPERTIES, "GetAll", (MEDIA,))[0])
+                clock = PlaybackClock()
             clock.observe(state)
             if now - last_request > 10:
                 call(media_path, MEDIA, "requestPlayerList")
                 last_request = now
-            for action, value in pending:
-                if action == "player" and value in state.get("playerList", []):
-                    call(media_path, PROPERTIES, "Set", (MEDIA, "player", (value,)))
+            for item in pending:
+                action, value = item[:2]
+                requested = item[2] if len(item) > 2 else state.get("player")
+                if not requested or requested not in players or (locked and locked not in players):
+                    continue
+                # A click acts on the player shown when it was made, even if another starts.
+                if requested != state.get("player"):
+                    call(media_path, PROPERTIES, "Set", (MEDIA, "player", (requested,)))
                     state = dict(call(media_path, PROPERTIES, "GetAll", (MEDIA,))[0])
                     clock = PlaybackClock()
-                elif state.get("playerList"):
-                    if action == "action" and value in ("PlayPause", "Previous", "Next"):
-                        call(media_path, MEDIA, "sendAction", (value,))
-                    elif action in ("volume", "set-volume"):
-                        volume = state.get("volume", 0) + value if action == "volume" else value
-                        volume = max(0, min(100, volume))
-                        call(media_path, PROPERTIES, "Set", (MEDIA, "volume", (volume,)))
-                        state["volume"] = volume
-                    elif action in ("seek", "position"):
-                        if action == "seek":
-                            target = seek_relative(call, media_path, MEDIA, state, value, clock)
-                        else:
-                            target = seek_to(call, media_path, MEDIA, state, value)
-                        if target is not None:
-                            state["position"] = target
-                            clock = PlaybackClock()
-                            clock.observe(state)
+                if action == "action" and value in ("PlayPause", "Previous", "Next"):
+                    call(media_path, MEDIA, "sendAction", (value,))
+                elif action in ("volume", "set-volume"):
+                    volume = state.get("volume", 0) + value if action == "volume" else value
+                    volume = max(0, min(100, volume))
+                    call(media_path, PROPERTIES, "Set", (MEDIA, "volume", (volume,)))
+                    state["volume"] = volume
+                elif action in ("seek", "position"):
+                    if action == "seek":
+                        target = seek_relative(call, media_path, MEDIA, state, value, clock)
+                    else:
+                        target = seek_to(call, media_path, MEDIA, state, value)
+                    if target is not None:
+                        state["position"] = target
+                        clock = PlaybackClock()
+                        clock.observe(state)
             state["device_name"] = device.get("name", CONFIG.get("device_name", "Phone"))
+            state["playerLocked"] = bool(locked)
+            state["playerAvailable"] = not locked or locked in players
+            state["followAvailable"] = bool(statuses)
+            if locked and locked not in players:
+                state.update(
+                    player=locked,
+                    title="Pinned player unavailable",
+                    artist="Start it on your phone or choose another player",
+                    localAlbumArtUrl="",
+                    isPlaying=False,
+                    canSeek=False,
+                )
+            CONFIG["last_player"] = state.get("player")
             updates.put(("state", state))
         except Exception as error:
-            # Disconnected commands are discarded, never replayed on reconnect.
+            # Do not replay queued clicks after reconnecting.
+            while not commands.empty():
+                try:
+                    item = commands.get_nowait()
+                    if item[0] in ("device", "follow", "player"):
+                        # Settings changes must still work while the phone is offline.
+                        if item[0] == "device":
+                            select_device(item[1])
+                        elif item[0] == "player":
+                            CONFIG["player_lock"] = item[1]
+                            save(CONFIG)
+                        elif item[1]:
+                            CONFIG.pop("player_lock", None)
+                            save(CONFIG)
+                except queue.Empty:
+                    break
             updates.put(("error", str(error)))
             stop.wait(1)
-        stop.wait(0.45)
+        stop.wait(0.35)
 
 
 # Ctrl+Alt bindings use MOD_NOREPEAT, so held keys don't queue track skips.

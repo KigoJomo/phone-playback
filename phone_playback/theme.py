@@ -2,7 +2,8 @@
 
 import ctypes as C
 from ctypes import wintypes as W
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QImage
+from PySide6.QtCore import QUrl, Qt
 
 FALLBACK = "#b7ebbe"
 
@@ -21,7 +22,39 @@ def windows_accent():
     return None
 
 
-def accent_for(settings):
+def album_accent(url):
+    """Extract a restrained accent from local art; never fetch an image URL."""
+    location = QUrl(url)
+    if not location.isLocalFile():
+        return None
+    image = QImage(location.toLocalFile())
+    if image.isNull():
+        return None
+    image = image.scaled(
+        32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+    )
+    bins = {}
+    for y in range(image.height()):
+        for x in range(image.width()):
+            c = image.pixelColor(x, y)
+            h, s, v, _ = c.getHsvF()
+            if c.alphaF() < 0.5 or s < 0.12 or v < 0.16:
+                continue
+            bucket = int(h * 24) % 24
+            weight = s * v
+            total, hs, ss, vs = bins.get(bucket, (0, 0, 0, 0))
+            bins[bucket] = (total + weight, hs + h * weight, ss + s * weight, vs + v * weight)
+    if not bins:
+        return None
+    total, h, s, v = max(bins.values(), key=lambda b: b[0])
+    return QColor.fromHsvF(
+        h / total, max(0.28, min(0.65, s / total)), max(0.72, min(0.92, v / total))
+    ).name()
+
+
+def accent_for(settings, album_colour=None):
+    if settings.get("theme_source") == "album" and album_colour:
+        return album_colour
     if settings.get("theme_source") == "custom":
         colour = QColor(settings.get("accent_colour", ""))
         if colour.isValid():
